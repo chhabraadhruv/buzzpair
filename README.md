@@ -26,7 +26,7 @@ A native macOS application that brings Google Fast Pair functionality to your Ma
 
 ### Method 1: Download Release
 
-1. Go to the [Releases](https://github.com/yourusername/buzzpair/releases) page
+1. Go to the [Releases](https://github.com/chhabraadhruv/buzzpair/releases) page
 2. Download the latest version of BuzzPair
 3. Drag the app to your Applications folder
 4. Launch BuzzPair
@@ -113,10 +113,9 @@ BuzzPair prioritizes your privacy:
 ### Getting Help
 
 If you encounter issues not covered here:
-- Check the [GitHub Issues](https://github.com/yourusername/buzzpair/issues) page
+- Check the [GitHub Issues](https://github.com/chhabraadhruv/buzzpair/issues) page
 - Create a new issue with details about your problem
-- Contact support at support@buzzpair.app
-
+- Contact support at dhruv22164@iiitd.ac.in
 ## Development Status
 
 BuzzPair is currently in beta. We're actively working to improve compatibility with more devices and add new features.
@@ -138,7 +137,7 @@ BuzzPair is released under the MIT License. See the [LICENSE](LICENSE) file for 
 
 ## Credits
 
-BuzzPair is developed and maintained by [Your Name/Organization].
+BuzzPair is developed and maintained by Dhruv Chhabra.
 
 Special thanks to:
 - The SwiftUI community
