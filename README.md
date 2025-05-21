@@ -1,8 +1,12 @@
 # BuzzPair for macOS
 
+<div align="center">
+  <img src="https://github.com/yourusername/buzzpair/raw/main/assets/buzzpair-icon.png" alt="BuzzPair Logo" width="200" height="200">
+</div>
+
 A native macOS application that brings Google Fast Pair functionality to your Mac, providing a seamless connection experience for Fast Pair compatible earbuds and headphones.
 
-https://drive.google.com/file/d/1_KU_9BhFt5pMCiSkiirxmX9nQjPEBMn8/view?usp=sharing
+![BuzzPair App](https://via.placeholder.com/800x500?text=BuzzPair+Screenshot)
 
 ## Features
 
