@@ -35,7 +35,7 @@ A native macOS application that brings Google Fast Pair functionality to your Ma
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/buzzpair.git
+   git clone https://github.com/chhabraadhruv/buzzpair.git
    cd buzzpair
    ```
 
