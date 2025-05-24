@@ -1,147 +1,154 @@
 import SwiftUI
+import Combine
 import CoreBluetooth
 import CryptoKit
-import UserNotifications
 import AVFoundation
+import UserNotifications
 
-// MARK: - Models
-struct FastPairDevice: Identifiable, Hashable {
-    let id = UUID()
-    let name: String
-    let peripheral: CBPeripheral
-    let rssi: NSNumber
+// MARK: - Main App
+@main
+struct BuzzPairApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @StateObject private var fastPairManager = FastPairManager()
+    @StateObject private var deviceManager = DeviceManager()
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(fastPairManager)
+                .environmentObject(deviceManager)
+        }
+        .windowStyle(HiddenTitleBarWindowStyle())
+        .windowResizability(.contentSize)
+        
+        MenuBarExtra("BuzzPair", systemImage: "airpods") {
+            MenuBarView()
+                .environmentObject(fastPairManager)
+                .environmentObject(deviceManager)
+        }
+    }
+}
+
+// MARK: - App Delegate
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Request notification permissions
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+}
+
+// MARK: - Fast Pair Models
+struct FastPairDevice: Identifiable, Codable {
+    let id: UUID
     let modelId: String
-    var isConnected: Bool = false
-    var batteryLevel: Int? = nil
-    var ancMode: ANCMode = .off
+    let accountKey: Data
+    let name: String
+    let deviceType: DeviceType
+    var batteryLevel: Int?
+    var isConnected: Bool
+    var connectionTime: Date?
     
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
+    init(modelId: String, accountKey: Data, name: String, deviceType: DeviceType, batteryLevel: Int? = nil) {
+        self.id = UUID()
+        self.modelId = modelId
+        self.accountKey = accountKey
+        self.name = name
+        self.deviceType = deviceType
+        self.batteryLevel = batteryLevel
+        self.isConnected = false
+        self.connectionTime = nil
     }
     
-    static func == (lhs: FastPairDevice, rhs: FastPairDevice) -> Bool {
-        lhs.id == rhs.id
+    enum DeviceType: String, Codable, CaseIterable {
+        case earbuds = "earbuds"
+        case headphones = "headphones"
+        case speaker = "speaker"
+        
+        var icon: String {
+            switch self {
+            case .earbuds: return "airpods"
+            case .headphones: return "headphones"
+            case .speaker: return "hifispeaker"
+            }
+        }
     }
+}
+
+struct AudioProfile: Codable, Equatable {
+    let name: String
+    let bassBoost: Float
+    let trebleBoost: Float
+    let midBoost: Float
 }
 
 enum ANCMode: String, CaseIterable {
+    case off = "Off"
     case noiseCancellation = "Noise Cancellation"
     case transparency = "Transparency"
-    case off = "Off"
     
     var icon: String {
         switch self {
-        case .noiseCancellation: return "noise.reducer"
-        case .transparency: return "transparency"
-        case .off: return "speaker.slash"
+        case .off: return "speaker.wave.1"
+        case .noiseCancellation: return "speaker.slash"
+        case .transparency: return "speaker.wave.3"
         }
     }
 }
 
-enum EQPreset: String, CaseIterable {
-    case balanced = "Balanced"
-    case bass = "Bass Boost"
-    case treble = "Treble Boost"
-    case vocal = "Vocal"
-    case rock = "Rock"
-    case jazz = "Jazz"
-    
-    var icon: String {
-        switch self {
-        case .balanced: return "music.note"
-        case .bass: return "waveform.path.badge.plus"
-        case .treble: return "waveform.path.ecg"
-        case .vocal: return "mic"
-        case .rock: return "guitars"
-        case .jazz: return "music.quarternote.3"
-        }
-    }
-}
-
-// MARK: - Google Fast Pair Service
-class GoogleFastPairService: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    // Google Fast Pair Service UUID
-    private let fastPairServiceUUID = CBUUID(string: "FE2C")
-    private let modelIdCharacteristicUUID = CBUUID(string: "1233")
-    private let keyBasedPairingCharacteristicUUID = CBUUID(string: "1234")
-    private let passphroughCharacteristicUUID = CBUUID(string: "1235")
-    private let accountKeyCharacteristicUUID = CBUUID(string: "1236")
-    
-    private var centralManager: CBCentralManager?
-    private var discoveredPeripherals: [CBPeripheral] = []
-    private var connectedPeripheral: CBPeripheral?
-    
+// MARK: - Fast Pair ManageR
+class FastPairManager: NSObject, ObservableObject {
     @Published var discoveredDevices: [FastPairDevice] = []
-    @Published var connectedDevice: FastPairDevice?
     @Published var isScanning = false
-    @Published var connectionStatus = "Ready to scan"
-    @Published var isBluetoothReady = false
+    @Published var bluetoothState: CBManagerState = .unknown
+    private func extractModelId(from fastPairData: Data) -> String {
+        // The Model ID is a 24-bit (3-byte) unsigned integer at the beginning of the service data.
+        guard fastPairData.count >= 3 else {
+            print("Warning: Fast Pair data too short to extract Model ID. Data count: \(fastPairData.count)")
+            return "000000" // Default or error value
+        }
+
+        // Extract the first 3 bytes
+        let modelIdBytes = fastPairData.prefix(3)
+
+        // Convert 3 bytes to a UInt32 (assuming big-endian, common in BLE)
+        // Pad with a leading zero byte to make it 4 bytes for UInt32 conversion
+        var modelId: UInt32 = 0
+        // Use withUnsafeBytes to directly copy bytes, ensuring correct endianness if necessary.
+        // For a 24-bit ID, it's typically read as a 3-byte value. If direct UInt32, assume big-endian.
+        // Here, we manually combine the bytes for clarity and explicit big-endian interpretation.
+        modelId = UInt32(modelIdBytes[0]) << 16 | UInt32(modelIdBytes[1]) << 8 | UInt32(modelIdBytes[2])
+
+        // Format as a 6-character hexadecimal string
+        return String(format: "%06X", modelId)
+    }
+
     
-    // Known Fast Pair Model IDs (in real implementation, these would come from Google's registry)
-    private let knownModelIds: [String: String] = [
-        "0x72CF9C": "Pixel Buds Pro",
-        "0x0001F0": "Sony WH-1000XM4",
-        "0x0A1710": "Bose QuietComfort Earbuds",
-        "0x0E30C3": "JBL Live Pro+",
-        "0x92BBBD": "Pixel Buds A-Series"
-    ]
+    private var centralManager: CBCentralManager!
+    private var discoveredPeripherals: [CBPeripheral] = []
+    private let fastPairServiceUUID = CBUUID(string: "FE2C")
     
     override init() {
         super.init()
-        requestNotificationPermission()
-        
-        // Check system compatibility first
-        checkSystemCompatibility()
-        
-        // Delay initialization to ensure proper setup
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            // Initialize with minimal options first
-            self.centralManager = CBCentralManager(delegate: self, queue: DispatchQueue.main, options: nil)
-        }
-    }
-    
-    private func checkSystemCompatibility() {
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        print("🖥️ macOS Version: \(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)")
-        
-        if osVersion.majorVersion < 12 {
-            print("⚠️ Warning: BuzzPair requires macOS 12.0 or later")
-        }
-    }
-    
-    private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        centralManager = CBCentralManager(delegate: self, queue: nil)
     }
     
     func startScanning() {
-        guard let centralManager = centralManager else {
-            connectionStatus = "Bluetooth manager not initialized"
+        guard bluetoothState == .poweredOn else {
+            print("Bluetooth not powered on. Current state: \(bluetoothState)")
             return
         }
         
-        guard centralManager.state == .poweredOn else {
-            connectionStatus = "Bluetooth not ready: \(centralManager.state)"
-            return
-        }
-        
+        print("Starting Fast Pair scan...")
         isScanning = true
-        connectionStatus = "Scanning for Fast Pair devices..."
-        discoveredDevices.removeAll()
         
-        // First scan for Fast Pair service
-        centralManager.scanForPeripherals(withServices: [fastPairServiceUUID], options: [
-            CBCentralManagerScanOptionAllowDuplicatesKey: false
-        ])
-        
-        // Also scan for devices without service filter to catch more devices
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            if self.isScanning && self.discoveredDevices.isEmpty {
-                print("🔍 Expanding search to all devices...")
-                centralManager.scanForPeripherals(withServices: nil, options: [
-                    CBCentralManagerScanOptionAllowDuplicatesKey: false
-                ])
-            }
-        }
+        // Scan for all devices first, then filter for Fast Pair compatible ones
+        centralManager.scanForPeripherals(
+            withServices: nil, // Scan for all devices to catch Fast Pair devices
+            options: [
+                CBCentralManagerScanOptionAllowDuplicatesKey: true,
+                CBCentralManagerScanOptionSolicitedServiceUUIDsKey: [fastPairServiceUUID]
+            ]
+        )
         
         // Stop scanning after 30 seconds
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
@@ -150,371 +157,439 @@ class GoogleFastPairService: NSObject, ObservableObject, CBCentralManagerDelegat
     }
     
     func stopScanning() {
-        centralManager?.stopScan()
+        centralManager.stopScan()
         isScanning = false
-        if discoveredDevices.isEmpty {
-            connectionStatus = "No Fast Pair devices found"
-        } else {
-            connectionStatus = "Found \(discoveredDevices.count) device(s)"
+    }
+    
+    func connectToDevice(_ device: FastPairDevice) {
+        // Find the peripheral for this device
+        if let peripheral = discoveredPeripherals.first(where: { $0.name == device.name }) {
+            centralManager.connect(peripheral, options: nil)
         }
     }
     
-    func connect(to device: FastPairDevice) {
-        guard let centralManager = centralManager else { return }
+    
+    private func processAdvertisementData(_ advertisementData: [String: Any], peripheral: CBPeripheral) -> FastPairDevice? {
+        guard let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
+              let fastPairData = serviceData[fastPairServiceUUID] else {
+            return nil
+        }
         
-        connectionStatus = "Connecting to \(device.name)..."
-        centralManager.connect(device.peripheral, options: nil)
+        // Parse Fast Pair advertisement data
+        let modelId = extractModelId(from: fastPairData)
+        let accountKey = generateAccountKey()
+        
+        return FastPairDevice(
+            modelId: modelId,
+            accountKey: accountKey,
+            name: peripheral.name ?? "Unknown Device",
+            deviceType: determineDeviceType(from: peripheral.name ?? "")
+        )
     }
     
-    func disconnect() {
-        guard let peripheral = connectedPeripheral else { return }
-        centralManager?.cancelPeripheralConnection(peripheral)
+    private func generateAccountKey() -> Data {
+        // Generate account key using CryptoKit
+        let key = SymmetricKey(size: .bits256)
+        return key.withUnsafeBytes { Data($0) }
     }
     
-    private func performFastPairHandshake(with peripheral: CBPeripheral) {
-        // Discover Fast Pair service
-        peripheral.discoverServices([fastPairServiceUUID])
+    private func determineDeviceType(from name: String) -> FastPairDevice.DeviceType {
+        let lowercaseName = name.lowercased()
+        if lowercaseName.contains("buds") || lowercaseName.contains("pods") {
+            return .earbuds
+        } else if lowercaseName.contains("headphones") || lowercaseName.contains("headset") {
+            return .headphones
+        } else {
+            return .speaker
+        }
     }
     
-    private func sendNotification(title: String, body: String) {
+    private func sendNotification(for device: FastPairDevice) {
         let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = UNNotificationSound.default
+        content.title = "Fast Pair Device Found"
+        content.body = "\(device.name) is ready to connect"
+        content.sound = .default
         
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        let request = UNNotificationRequest(
+            identifier: device.id.uuidString,
+            content: content,
+            trigger: nil
+        )
+        
         UNUserNotificationCenter.current().add(request)
     }
-    
-    // MARK: - CBCentralManagerDelegate
+}
+
+// MARK: - Core Bluetooth Delegate
+extension FastPairManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         DispatchQueue.main.async {
+            self.bluetoothState = central.state
+            print("Bluetooth state changed to: \(central.state.rawValue)")
+            
             switch central.state {
             case .poweredOn:
-                self.connectionStatus = "Bluetooth ready"
-                self.isBluetoothReady = true
-                print("✅ Bluetooth is powered on and ready")
+                print("Bluetooth is powered on and ready")
+                // Auto-start scanning when Bluetooth becomes available
+                if !self.isScanning {
+                    self.startScanning()
+                }
             case .poweredOff:
-                self.connectionStatus = "Bluetooth is off - Please turn on Bluetooth"
-                self.isBluetoothReady = false
-                print("❌ Bluetooth is powered off")
+                print("Bluetooth is powered off")
+                self.isScanning = false
+                self.discoveredDevices.removeAll()
+                self.discoveredPeripherals.removeAll()
             case .unauthorized:
-                self.connectionStatus = "Bluetooth access denied - Check Privacy settings"
-                self.isBluetoothReady = false
-                print("❌ Bluetooth unauthorized")
+                print("Bluetooth access not authorized")
             case .unsupported:
-                self.connectionStatus = "Bluetooth LE not supported on this Mac"
-                self.isBluetoothReady = false
-                print("❌ Bluetooth LE unsupported")
-            case .unknown:
-                self.connectionStatus = "Bluetooth state unknown - Checking..."
-                self.isBluetoothReady = false
-                print("⚠️ Bluetooth state unknown")
-            case .resetting:
-                self.connectionStatus = "Bluetooth is resetting..."
-                self.isBluetoothReady = false
-                print("🔄 Bluetooth resetting")
-            @unknown default:
-                self.connectionStatus = "Unknown Bluetooth state"
-                self.isBluetoothReady = false
-                print("❓ Unknown Bluetooth state: \(central.state.rawValue)")
+                print("Bluetooth not supported on this device")
+            default:
+                print("Bluetooth state: \(central.state)")
             }
         }
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        print("🔍 Discovered device: \(peripheral.name ?? "Unknown") - RSSI: \(RSSI)")
-        print("📡 Advertisement data: \(advertisementData)")
         
-        // Check if this is a Fast Pair device
-        var isFastPairDevice = false
-        var modelId = "0x000000"
-        var deviceName = peripheral.name ?? "Unknown Device"
+        print("Discovered device: \(peripheral.name ?? "Unknown") - RSSI: \(RSSI)")
+        print("Advertisement data: \(advertisementData)")
         
-        // Check for Fast Pair service data
-        if let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
-           let fastPairData = serviceData[fastPairServiceUUID] {
-            modelId = extractModelId(from: fastPairData)
-            deviceName = knownModelIds[modelId] ?? deviceName
-            isFastPairDevice = true
-            print("✅ Fast Pair device detected with Model ID: \(modelId)")
-        }
+        // Check if this is a potential Fast Pair device
+        let isFastPairCandidate = checkIfFastPairCandidate(peripheral: peripheral, advertisementData: advertisementData)
         
-        // Also check for known device names that might support Fast Pair
-        let fastPairKeywords = ["buds", "pixel", "sony", "bose", "jbl", "earbuds", "headphones"]
-        let nameContainsFastPairKeyword = fastPairKeywords.contains { keyword in
-            deviceName.lowercased().contains(keyword)
-        }
-        
-        if isFastPairDevice || nameContainsFastPairKeyword {
-            let device = FastPairDevice(
-                name: deviceName,
-                peripheral: peripheral,
-                rssi: RSSI,
-                modelId: modelId
-            )
+        if isFastPairCandidate {
+            guard !discoveredPeripherals.contains(where: { $0.identifier == peripheral.identifier }) else { return }
             
-            if !discoveredDevices.contains(device) {
-                DispatchQueue.main.async {
-                    self.discoveredDevices.append(device)
-                    print("➕ Added device: \(deviceName)")
-                    
-                    // Send notification for nearby device
-                    self.sendNotification(
-                        title: "Fast Pair Device Found",
-                        body: "\(deviceName) is ready to connect"
-                    )
-                }
+            let device = createFastPairDevice(from: peripheral, advertisementData: advertisementData)
+            
+            DispatchQueue.main.async {
+                self.discoveredDevices.append(device)
+                self.discoveredPeripherals.append(peripheral)
+                self.sendNotification(for: device)
             }
-        } else {
-            print("ℹ️ Device \(deviceName) doesn't appear to support Fast Pair")
         }
     }
     
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        peripheral.delegate = self
-        connectedPeripheral = peripheral
-        
-        if let deviceIndex = discoveredDevices.firstIndex(where: { $0.peripheral == peripheral }) {
-            discoveredDevices[deviceIndex].isConnected = true
-            connectedDevice = discoveredDevices[deviceIndex]
+    private func checkIfFastPairCandidate(peripheral: CBPeripheral, advertisementData: [String: Any]) -> Bool {
+        // Check for Fast Pair service UUID in advertisement
+        if let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] {
+            if serviceUUIDs.contains(fastPairServiceUUID) {
+                return true
+            }
         }
         
-        connectionStatus = "Connected to \(peripheral.name ?? "device")"
-        performFastPairHandshake(with: peripheral)
+        // Check for Fast Pair service data
+        if let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
+            if serviceData[fastPairServiceUUID] != nil {
+                return true
+            }
+        }
         
-        sendNotification(
-            title: "Device Connected",
-            body: "\(peripheral.name ?? "Your device") is now connected"
+        // Check device name patterns for known Fast Pair compatible devices
+//        if let deviceName = peripheral.name?.lowercased() {
+//            let fastPairPatterns = [
+//                "pixel buds", "pixelbuds",
+//                "wh-1000xm", "wf-1000xm", "linkbuds",
+//                "quietcomfort", "bose",
+//                "jbl", "flip", "charge",
+//                "galaxy buds", "gear icon"
+//            ]
+//
+//            for pattern in fastPairPatterns {
+//                if deviceName.contains(pattern) {
+//                    return true
+//                }
+//            }
+//        }
+        
+        // Check manufacturer data for Google's company identifier (0x00E0)
+        if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data {
+            if manufacturerData.count >= 2 {
+                let companyId = manufacturerData.prefix(2).withUnsafeBytes { $0.load(as: UInt16.self) }
+                if companyId == 0x00E0 { // Google's Bluetooth SIG company ID
+                    return true
+                }
+            }
+        }
+        
+        return false
+    }
+    
+    private func createFastPairDevice(from peripheral: CBPeripheral, advertisementData: [String: Any]) -> FastPairDevice {
+        // Correctly extract the fastPairData first
+        guard let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
+              let fastPairData = serviceData[fastPairServiceUUID] else {
+            // Handle case where Fast Pair data is missing (e.g., return a default device or nil)
+            print("Error: Could not extract Fast Pair service data for device \(peripheral.name ?? "Unknown")")
+            // You might want to return an optional FastPairDevice or a default one
+            // For simplicity, returning a default and logging. You might refine this.
+            return FastPairDevice(modelId: "ERROR", accountKey: generateAccountKey(), name: peripheral.name ?? "Unknown Device", deviceType: .speaker)
+        }
+
+        let modelId = extractModelId(from: fastPairData) // <--- THIS IS CORRECT NOW
+        let accountKey = generateAccountKey()
+        let deviceName = peripheral.name ?? "Unknown Fast Pair Device"
+        let deviceType = determineDeviceType(from: deviceName)
+
+        return FastPairDevice(
+            modelId: modelId,
+            accountKey: accountKey,
+            name: deviceName,
+            deviceType: deviceType
         )
     }
     
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        connectedPeripheral = nil
-        connectedDevice = nil
-        
-        if let deviceIndex = discoveredDevices.firstIndex(where: { $0.peripheral == peripheral }) {
-            discoveredDevices[deviceIndex].isConnected = false
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // Handle successful connection
+        if let index = discoveredDevices.firstIndex(where: { $0.name == peripheral.name }) {
+            discoveredDevices[index].isConnected = true
+            discoveredDevices[index].connectionTime = Date()
         }
-        
-        connectionStatus = "Disconnected"
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        connectionStatus = "Failed to connect: \(error?.localizedDescription ?? "Unknown error")"
+        print("Failed to connect to \(peripheral.name ?? "Unknown"): \(error?.localizedDescription ?? "Unknown error")")
+    }
+}
+
+// MARK: - Device Manager
+class DeviceManager: ObservableObject {
+    @Published var connectedDevices: [FastPairDevice] = []
+    @Published var currentVolume: Float = 0.5
+    @Published var currentANCMode: ANCMode = .off
+    @Published var selectedAudioProfile = AudioProfile(name: "Balanced", bassBoost: 0, trebleBoost: 0, midBoost: 0)
+    
+    private var audioEngine = AVAudioEngine()
+    private var audioUnit: AVAudioUnit?
+    
+    let audioProfiles = [
+        AudioProfile(name: "Balanced", bassBoost: 0, trebleBoost: 0, midBoost: 0),
+        AudioProfile(name: "Bass Boost", bassBoost: 0.3, trebleBoost: 0, midBoost: 0),
+        AudioProfile(name: "Vocal", bassBoost: -0.1, trebleBoost: 0.2, midBoost: 0.3),
+        AudioProfile(name: "Treble Boost", bassBoost: 0, trebleBoost: 0.3, midBoost: 0)
+    ]
+    
+    func setVolume(_ volume: Float) {
+        currentVolume = volume
+        // Apply volume to connected devices
+        applyVolumeToDevices()
     }
     
-    // MARK: - CBPeripheralDelegate
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
-        
-        for service in services where service.uuid == fastPairServiceUUID {
-            peripheral.discoverCharacteristics([
-                modelIdCharacteristicUUID,
-                keyBasedPairingCharacteristicUUID,
-                passphroughCharacteristicUUID,
-                accountKeyCharacteristicUUID
-            ], for: service)
-        }
+    func setANCMode(_ mode: ANCMode) {
+        currentANCMode = mode
+        // Send ANC command to connected devices
+        applyANCModeToDevices()
     }
     
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let characteristics = service.characteristics else { return }
-        
-        for characteristic in characteristics {
-            switch characteristic.uuid {
-            case keyBasedPairingCharacteristicUUID:
-                performKeyBasedPairing(peripheral: peripheral, characteristic: characteristic)
-            default:
-                break
-            }
-        }
+    func setAudioProfile(_ profile: AudioProfile) {
+        selectedAudioProfile = profile
+        // Apply EQ settings
+        applyEQSettings()
     }
     
-    // MARK: - Fast Pair Crypto Implementation
-    private func extractModelId(from data: Data) -> String {
-        // Extract model ID from Fast Pair advertisement data
-        if data.count >= 3 {
-            let modelIdBytes = data.subdata(in: 0..<3)
-            return "0x" + modelIdBytes.map { String(format: "%02X", $0) }.joined()
-        }
-        return "0x000000"
+    private func applyVolumeToDevices() {
+        // Implementation for applying volume to Fast Pair devices
+        // This would involve sending the appropriate Bluetooth commands
     }
     
-    private func performKeyBasedPairing(peripheral: CBPeripheral, characteristic: CBCharacteristic) {
-        // Generate key pair for pairing
-        let privateKey = P256.KeyAgreement.PrivateKey()
-        let publicKeyData = privateKey.publicKey.rawRepresentation
-        
-        // Create pairing request (simplified implementation)
-        var pairingRequest = Data()
-        pairingRequest.append(0x00) // Key-based pairing type
-        pairingRequest.append(publicKeyData)
-        
-        // Write pairing request
-        peripheral.writeValue(pairingRequest, for: characteristic, type: .withResponse)
+    private func applyANCModeToDevices() {
+        // Implementation for toggling ANC modes
+        // This involves sending specific Fast Pair protocol commands
     }
     
-    // MARK: - Device Controls
-    func toggleANCMode(for device: FastPairDevice) {
-        guard let peripheral = connectedPeripheral else { return }
-        
-        let newMode: ANCMode
-        switch device.ancMode {
-        case .off:
-            newMode = .noiseCancellation
-        case .noiseCancellation:
-            newMode = .transparency
-        case .transparency:
-            newMode = .off
-        }
-        
-        // Update local state
-        if let index = discoveredDevices.firstIndex(where: { $0.id == device.id }) {
-            discoveredDevices[index].ancMode = newMode
-            connectedDevice?.ancMode = newMode
-        }
-        
-        // Send ANC command to device (implementation would depend on device protocol)
-        sendANCCommand(peripheral: peripheral, mode: newMode)
-    }
-    
-    private func sendANCCommand(peripheral: CBPeripheral, mode: ANCMode) {
-        // This would send the actual ANC command to the device
-        // Implementation depends on the specific device protocol
-        print("Setting ANC mode to: \(mode.rawValue)")
-    }
-    
-    func updateVolume(_ volume: Double) {
-        // Update system volume or send volume command to device
-        let volumeScript = """
-            set volume output volume \(Int(volume * 100))
-        """
-        
-        if let script = NSAppleScript(source: volumeScript) {
-            script.executeAndReturnError(nil)
-        }
-    }
-    
-    func setEQPreset(_ preset: EQPreset) {
-        guard let peripheral = connectedPeripheral else { return }
-        
-        // Send EQ preset command to device
-        sendEQCommand(peripheral: peripheral, preset: preset)
-    }
-    
-    private func sendEQCommand(peripheral: CBPeripheral, preset: EQPreset) {
-        // This would send the actual EQ command to the device
-        print("Setting EQ preset to: \(preset.rawValue)")
+    private func applyEQSettings() {
+        // Implementation for applying EQ settings
+        // This would configure the audio engine with the selected profile
     }
 }
 
 // MARK: - Main Content View
 struct ContentView: View {
-    @StateObject private var fastPairService = GoogleFastPairService()
-    @State private var volume: Double = 0.5
-    @State private var selectedEQPreset: EQPreset = .balanced
-    @State private var showingDeviceDetails = false
+    @EnvironmentObject var fastPairManager: FastPairManager
+    @EnvironmentObject var deviceManager: DeviceManager
+    @State private var selectedTab = 0
     
     var body: some View {
         NavigationView {
-            VStack(spacing: 20) {
-                // Header
-                headerView
+            VStack(spacing: 0) {
+                HeaderView()
                 
-                // Connection Status
-                statusView
-                
-                // Device List
-                deviceListView
-                
-                // Connected Device Controls
-                if let connectedDevice = fastPairService.connectedDevice {
-                    connectedDeviceView(connectedDevice)
-                }
-                
-                Spacer()
-            }
-            .padding()
-            .navigationTitle("BuzzPair")
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    scanButton
+                TabView(selection: $selectedTab) {
+                    DevicesView()
+                        .tabItem {
+                            Image(systemName: "airpods")
+                            Text("Devices")
+                        }
+                        .tag(0)
+                    
+                    ControlsView()
+                        .tabItem {
+                            Image(systemName: "slider.horizontal.3")
+                            Text("Controls")
+                        }
+                        .tag(1)
+                    
+                    SettingsView()
+                        .tabItem {
+                            Image(systemName: "gear")
+                            Text("Settings")
+                        }
+                        .tag(2)
                 }
             }
         }
-        .frame(minWidth: 400, minHeight: 600)
+        .frame(width: 400, height: 600)
+        .background(Color(NSColor.windowBackgroundColor))
     }
+}
+
+// MARK: - Header View
+struct HeaderView: View {
+    @EnvironmentObject var fastPairManager: FastPairManager
     
-    private var headerView: some View {
-        VStack {
-            Image(systemName: "headphones")
-                .font(.system(size: 60))
-                .foregroundColor(.blue)
-            
-            Text("BuzzPair")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-            
-            Text("Google Fast Pair for macOS")
-                .font(.caption)
-                .foregroundColor(.secondary)
-        }
-    }
-    
-    private var statusView: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Circle()
-                    .fill(fastPairService.isScanning ? Color.orange : (fastPairService.connectedDevice != nil ? Color.green : (fastPairService.isBluetoothReady ? Color.blue : Color.red)))
-                    .frame(width: 8, height: 8)
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text("BuzzPair")
+                    .font(.title2)
+                    .fontWeight(.bold)
                 
-                Text(fastPairService.connectionStatus)
+                Text("Fast Pair for macOS")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
-            // Debug info
-            if !fastPairService.isBluetoothReady {
-                Text("💡 Tip: Make sure Bluetooth is enabled and BuzzPair has permission")
-                    .font(.caption2)
-                    .foregroundColor(.orange)
+            Spacer()
+            
+            Button(action: {
+                if fastPairManager.isScanning {
+                    fastPairManager.stopScanning()
+                } else {
+                    fastPairManager.startScanning()
+                }
+            }) {
+                Image(systemName: fastPairManager.isScanning ? "stop.circle" : "magnifyingglass")
+                    .foregroundColor(.accentColor)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding()
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+}
+
+struct DevicesView: View {
+    @EnvironmentObject var fastPairManager: FastPairManager
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Available Devices")
+                    .font(.headline)
+                
+                Spacer()
+                
+                Text("Bluetooth: \(bluetoothStatusText)")
+                    .font(.caption)
+                    .foregroundColor(bluetoothStatusColor)
+            }
+            .padding(.horizontal)
+            
+            if fastPairManager.discoveredDevices.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: fastPairManager.isScanning ? "antenna.radiowaves.left.and.right" : "airpods")
+                        .font(.system(size: 48))
+                        .foregroundColor(.secondary)
+                        .symbolEffect(.pulse, options: .repeating, isActive: fastPairManager.isScanning)
+                    
+                    Text(fastPairManager.isScanning ? "Searching for devices..." : "No devices found")
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                    
+                    VStack(spacing: 8) {
+                        Text("To find Fast Pair devices:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        Text("1. Put your earbuds/headphones in pairing mode")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        
+                        Text("2. Make sure they're Fast Pair compatible")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        
+                        Text("3. Click the search button above")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
-            }
-        }
-    }
-    
-    private var deviceListView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if !fastPairService.discoveredDevices.isEmpty {
-                Text("Discovered Devices")
-                    .font(.headline)
-                    .padding(.leading)
-                
-                LazyVStack(spacing: 8) {
-                    ForEach(fastPairService.discoveredDevices) { device in
-                        deviceRow(device)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(fastPairManager.discoveredDevices) { device in
+                            DeviceCardView(device: device)
+                        }
                     }
+                    .padding(.horizontal)
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
     
-    private func deviceRow(_ device: FastPairDevice) -> some View {
-        HStack {
+    private var bluetoothStatusText: String {
+        switch fastPairManager.bluetoothState {
+        case .poweredOn: return "On"
+        case .poweredOff: return "Off"
+        case .unauthorized: return "Unauthorized"
+        case .unsupported: return "Unsupported"
+        case .resetting: return "Resetting"
+        default: return "Unknown"
+        }
+    }
+    
+    private var bluetoothStatusColor: Color {
+        switch fastPairManager.bluetoothState {
+        case .poweredOn: return .green
+        case .poweredOff: return .red
+        case .unauthorized: return .orange
+        default: return .secondary
+        }
+    }
+}
+
+// MARK: - Device Card View
+struct DeviceCardView: View {
+    let device: FastPairDevice
+    @EnvironmentObject var fastPairManager: FastPairManager
+    
+    var body: some View {
+        HStack(spacing: 16) {
+            Image(systemName: device.deviceType.icon)
+                .font(.system(size: 24))
+                .foregroundColor(.accentColor)
+                .frame(width: 40, height: 40)
+                .background(Color.accentColor.opacity(0.1))
+                .clipShape(Circle())
+            
             VStack(alignment: .leading, spacing: 4) {
                 Text(device.name)
                     .font(.headline)
                 
-                HStack {
-                    Text("RSSI: \(device.rssi)dBm")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    
-                    if let battery = device.batteryLevel {
-                        Text("Battery: \(battery)%")
-                            .font(.caption)
+                Text(device.deviceType.rawValue.capitalized)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                if let batteryLevel = device.batteryLevel {
+                    HStack(spacing: 4) {
+                        Image(systemName: "battery.\(batteryLevel > 75 ? "100" : batteryLevel > 50 ? "75" : batteryLevel > 25 ? "50" : "25")")
+                            .foregroundColor(batteryLevel > 25 ? .green : .orange)
+                        Text("\(batteryLevel)%")
+                            .font(.caption2)
                             .foregroundColor(.secondary)
                     }
                 }
@@ -522,169 +597,235 @@ struct ContentView: View {
             
             Spacer()
             
-            if device.isConnected {
-                Button("Disconnect") {
-                    fastPairService.disconnect()
+            Button(device.isConnected ? "Disconnect" : "Connect") {
+                if device.isConnected {
+                    // Disconnect logic
+                } else {
+                    fastPairManager.connectToDevice(device)
                 }
-                .buttonStyle(.bordered)
-                .tint(.red)
-            } else {
-                Button("Connect") {
-                    fastPairService.connect(to: device)
-                }
-                .buttonStyle(.borderedProminent)
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
         }
         .padding()
-        .background(device.isConnected ? Color.green.opacity(0.1) : Color.gray.opacity(0.1))
-        .cornerRadius(8)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
+}
+
+// MARK: - Controls View
+struct ControlsView: View {
+    @EnvironmentObject var deviceManager: DeviceManager
     
-    private func connectedDeviceView(_ device: FastPairDevice) -> some View {
-        VStack(spacing: 16) {
-            Text("Connected Device Controls")
+    var body: some View {
+        VStack(spacing: 24) {
+            Text("Audio Controls")
                 .font(.headline)
             
-            // ANC Controls
-            GroupBox("Noise Control") {
-                HStack {
-                    ForEach(ANCMode.allCases, id: \.self) { mode in
-                        Button(action: {
-                            fastPairService.toggleANCMode(for: device)
-                        }) {
-                            VStack {
-                                Image(systemName: mode.icon)
-                                    .font(.title2)
-                                Text(mode.rawValue)
-                                    .font(.caption)
-                            }
-                            .foregroundColor(device.ancMode == mode ? .white : .primary)
-                        }
-                        .buttonStyle(.bordered)
-                        .background(device.ancMode == mode ? Color.blue : Color.clear)
-                        .cornerRadius(8)
-                    }
-                }
-            }
-            
             // Volume Control
-            GroupBox("Volume") {
-                VStack {
-                    HStack {
-                        Image(systemName: "speaker.fill")
-                        Slider(value: $volume, in: 0...1) { _ in
-                            fastPairService.updateVolume(volume)
-                        }
-                        Image(systemName: "speaker.wave.3.fill")
-                    }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Volume")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                HStack {
+                    Image(systemName: "speaker.fill")
+                        .foregroundColor(.secondary)
                     
-                    Text("\(Int(volume * 100))%")
-                        .font(.caption)
+                    Slider(value: Binding(
+                        get: { deviceManager.currentVolume },
+                        set: { deviceManager.setVolume($0) }
+                    ), in: 0...1)
+                    
+                    Image(systemName: "speaker.3.fill")
                         .foregroundColor(.secondary)
                 }
             }
             
-            // EQ Controls
-            GroupBox("Equalizer") {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 8) {
-                    ForEach(EQPreset.allCases, id: \.self) { preset in
-                        Button(action: {
-                            selectedEQPreset = preset
-                            fastPairService.setEQPreset(preset)
-                        }) {
-                            VStack {
-                                Image(systemName: preset.icon)
-                                    .font(.title3)
-                                Text(preset.rawValue)
-                                    .font(.caption)
-                            }
-                            .foregroundColor(selectedEQPreset == preset ? .white : .primary)
+            // ANC Mode Control
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Active Noise Control")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Picker("ANC Mode", selection: Binding(
+                    get: { deviceManager.currentANCMode },
+                    set: { deviceManager.setANCMode($0) }
+                )) {
+                    ForEach(ANCMode.allCases, id: \.self) { mode in
+                        HStack {
+                            Image(systemName: mode.icon)
+                            Text(mode.rawValue)
                         }
-                        .buttonStyle(.bordered)
-                        .background(selectedEQPreset == preset ? Color.blue : Color.clear)
-                        .cornerRadius(6)
+                        .tag(mode)
                     }
+                }
+                .pickerStyle(.segmented)
+            }
+            
+            // Audio Profile Control
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Audio Profile")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Picker("Audio Profile", selection: Binding(
+                    get: { deviceManager.selectedAudioProfile.name },
+                    set: { profileName in
+                        if let profile = deviceManager.audioProfiles.first(where: { $0.name == profileName }) {
+                            deviceManager.setAudioProfile(profile)
+                        }
+                    }
+                )) {
+                    ForEach(deviceManager.audioProfiles.map(\.name), id: \.self) { profileName in
+                        Text(profileName).tag(profileName)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Settings View
+struct SettingsView: View {
+    @State private var showNotifications = true
+    @State private var autoConnect = true
+    @State private var batteryAlerts = true
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Settings")
+                .font(.headline)
+            
+            VStack(alignment: .leading, spacing: 16) {
+                Toggle("Show Notifications", isOn: $showNotifications)
+                Toggle("Auto-connect to known devices", isOn: $autoConnect)
+                Toggle("Battery level alerts", isOn: $batteryAlerts)
+            }
+            
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 12) {
+                Text("About")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Text("BuzzPair v1.0.0")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                Text("Developed by Dhruv Chhabra")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                Link("GitHub Repository", destination: URL(string: "https://github.com/chhabraadhruv/buzzpair")!)
+                    .font(.caption)
+            }
+            
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+// MARK: - Menu Bar View
+struct MenuBarView: View {
+    @EnvironmentObject var fastPairManager: FastPairManager
+    @EnvironmentObject var deviceManager: DeviceManager
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("BuzzPair")
+                .font(.headline)
+                .padding(.horizontal)
+            
+            Divider()
+            
+            if deviceManager.connectedDevices.isEmpty {
+                Text("No devices connected")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+            } else {
+                ForEach(deviceManager.connectedDevices) { device in
+                    HStack {
+                        Image(systemName: device.deviceType.icon)
+                            .foregroundColor(.accentColor)
+                        
+                        Text(device.name)
+                            .font(.caption)
+                        
+                        Spacer()
+                        
+                        if let batteryLevel = device.batteryLevel {
+                            Text("\(batteryLevel)%")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.horizontal)
                 }
             }
             
-            // Battery Status
-            if let battery = device.batteryLevel {
-                GroupBox("Battery") {
-                    HStack {
-                        Image(systemName: battery > 20 ? "battery.100" : "battery.25")
-                            .foregroundColor(battery > 20 ? .green : .red)
-                        Text("\(battery)%")
-                            .font(.headline)
-                        Spacer()
-                    }
-                }
+            Divider()
+            
+            Button("Open BuzzPair") {
+                NSApp.activate(ignoringOtherApps: true)
             }
+            .padding(.horizontal)
+            
+            Button("Quit") {
+                NSApplication.shared.terminate(nil)
+            }
+            .padding(.horizontal)
         }
-        .padding()
-        .background(Color.gray.opacity(0.05))
-        .cornerRadius(12)
-    }
-    
-    private var scanButton: some View {
-        Button(action: {
-            if fastPairService.isScanning {
-                fastPairService.stopScanning()
-            } else {
-                fastPairService.startScanning()
-            }
-        }) {
-            HStack {
-                Image(systemName: fastPairService.isScanning ? "stop.circle" : "magnifyingglass")
-                Text(fastPairService.isScanning ? "Stop" : "Scan")
-            }
-        }
-        .disabled(!fastPairService.isBluetoothReady)
+        .frame(width: 200)
     }
 }
 
-// MARK: - Menu Bar Support
-class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem?
-    var popover = NSPopover()
-    
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // Create menu bar item
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        
-        if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "headphones", accessibilityDescription: "BuzzPair")
-            button.action = #selector(showPopover)
-            button.target = self
-        }
-        
-        // Configure popover
-        popover.contentViewController = NSHostingController(rootView: ContentView())
-        popover.behavior = .transient
+// MARK: - Crypto Extensions
+extension Data {
+    func aesEncrypt(key: SymmetricKey) throws -> Data {
+        let sealedBox = try AES.GCM.seal(self, using: key)
+        return sealedBox.combined ?? Data()
     }
     
-    @objc func showPopover() {
-        if let button = statusItem?.button {
-            if popover.isShown {
-                popover.performClose(nil)
-            } else {
-                popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            }
-        }
+    func aesDecrypt(key: SymmetricKey) throws -> Data {
+        let sealedBox = try AES.GCM.SealedBox(combined: self)
+        return try AES.GCM.open(sealedBox, using: key)
     }
 }
 
-// MARK: - App Entry Point
-@main
-struct BuzzPairApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+// MARK: - Fast Pair Crypto Helper
+class FastPairCrypto {
+    static func deriveSharedSecret(privateKey: P256.KeyAgreement.PrivateKey, publicKey: P256.KeyAgreement.PublicKey) throws -> SharedSecret {
+        return try privateKey.sharedSecretFromKeyAgreement(with: publicKey)
+    }
     
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-        .windowResizability(.contentSize)
-        .commands {
-            CommandGroup(replacing: .newItem) { }
-        }
+    static func generateKeyPair() -> P256.KeyAgreement.PrivateKey {
+        return P256.KeyAgreement.PrivateKey()
+    }
+    
+    static func performHandshake(with devicePublicKey: Data) throws -> (SymmetricKey, Data) {
+        let privateKey = generateKeyPair()
+        let publicKey = privateKey.publicKey
+        
+        let deviceKey = try P256.KeyAgreement.PublicKey(rawRepresentation: devicePublicKey)
+        let sharedSecret = try deriveSharedSecret(privateKey: privateKey, publicKey: deviceKey)
+        
+        let symmetricKey = sharedSecret.hkdfDerivedSymmetricKey(
+            using: SHA256.self,
+            salt: Data(),
+            sharedInfo: Data(),
+            outputByteCount: 32
+        )
+        
+        return (symmetricKey, publicKey.rawRepresentation)
     }
 }
